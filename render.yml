@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: eing-storekh-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python premium_shop_bot_v17.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ABA_API_KEY
+        sync: false
+      - key: ABA_MERCHANT_ID
+        sync: false
+      - key: STORE_NAME
+        value: "Eing StoreKh"
+      - key: DATA_DIR
+        value: /var/data
+      - key: PYTHON_VERSION
+        value: 3.11.9
+    disk:
+      name: eing-storekh-data
+      mountPath: /var/data
+      sizeGB: 1
