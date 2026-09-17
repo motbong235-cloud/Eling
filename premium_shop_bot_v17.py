@@ -746,6 +746,46 @@ def _strip_glyph(text, glyph):
     return cleaned if cleaned else text
 
 
+def _safe_callback_data(data):
+    """Telegram callback_data ត្រូវមាន 1–64 bytes (UTF-8)។ កាត់ឲ្យខ្លីបើវែងពេក
+    (ជាញឹកញាប់កើតពី product key វែង ឬ emoji hex encoding) — បើទទេត្រឡប់ None។"""
+    if data is None:
+        return None
+    s = str(data)
+    if not s:
+        return None
+    raw = s.encode("utf-8")
+    if len(raw) <= 64:
+        return s
+    # កាត់តាម byte boundary ដើម្បីកុំបំបែក UTF-8 multi-byte char
+    truncated = raw[:64]
+    while truncated:
+        try:
+            return truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return None
+
+
+def _safe_button_text(text):
+    """Telegram កំណត់ button text ≤ 64 characters។ កាត់ + … បើវែងពេក។"""
+    if not text:
+        return "·"
+    s = str(text)
+    if len(s) <= 64:
+        return s
+    return s[:61] + "…"
+
+
+def _valid_custom_emoji_id(icon_id):
+    """custom_emoji_id ត្រូវជាខ្សែលេខ (digit string)។ ID មិនត្រឹមត្រូវ → Telegram
+    បដិសេធ keyboard ទាំងមូលជា BUTTON_DATA_INVALID។"""
+    if icon_id is None:
+        return False
+    s = str(icon_id).strip()
+    return bool(s) and s.isdigit()
+
+
 _pbtn_debug = {"last_reason": None, "icon_attempted": 0, "icon_sent": 0, "style_attempted": 0}
 
 # --- Force-inject style/icon_custom_emoji_id ចូល JSON ជានិច្ច ---
@@ -783,17 +823,31 @@ _patch_button_serialize(types.KeyboardButton)
 
 
 def _build_styled_button(cls, text, style, icon_id, clean_text, use_text, **kw):
+    # ការពារ BUTTON_DATA_INVALID: កាត់ callback_data ≤64 bytes, text ≤64 chars
+    if "callback_data" in kw:
+        safe_cd = _safe_callback_data(kw.get("callback_data"))
+        if safe_cd is None and kw.get("url") is None and kw.get("web_app") is None:
+            # callback button ត្រូវមាន data — បើទទេបន្ទាប់ពី truncate ប្រើ "noop"
+            safe_cd = "noop"
+        kw["callback_data"] = safe_cd
+    use_text = _safe_button_text(use_text)
+    text = _safe_button_text(text)
+    # icon_custom_emoji_id មិនត្រឹមត្រូវ → Telegram បដិសេធ keyboard ទាំងមូល
+    if icon_id and not _valid_custom_emoji_id(icon_id):
+        print(f"[pbtn] skip invalid icon_custom_emoji_id={icon_id!r}", flush=True)
+        icon_id = None
+        use_text = text  # ប្រើ text ដើម (មាន glyph) ព្រោះគ្មាន icon premium
     try:
         btn = cls(use_text, **kw)
     except TypeError as e:
         _pbtn_debug["last_reason"] = f"TypeError លើ constructor មូលដ្ឋាន ({cls.__name__}): {e}"
         print(f"[pbtn] {_pbtn_debug['last_reason']}", flush=True)
         return cls(text, **kw)
-    if style:
+    if style in ("primary", "success", "danger"):
         btn._pbtn_style = style
         _pbtn_debug["style_attempted"] += 1
     if icon_id:
-        btn._pbtn_icon_id = icon_id
+        btn._pbtn_icon_id = str(icon_id)
         _pbtn_debug["icon_attempted"] += 1
         _pbtn_debug["icon_sent"] += 1
         _pbtn_debug["last_reason"] = "ok (force-injected)"
@@ -803,7 +857,8 @@ def _build_styled_button(cls, text, style, icon_id, clean_text, use_text, **kw):
 def pbtn(text, callback_data=None, style=None, url=None, **kw):
     """InlineKeyboardButton (ប៊ូតុងភ្ជាប់នឹងសារ) ជាមួយ icon premium (បើមាន) + style ពណ៌
     (Bot API 9.4: success/danger/primary)។ បង្ខំដាក់ style/icon_custom_emoji_id ចូល JSON
-    ជានិច្ច (មើល _patch_button_serialize ខាងលើ)។"""
+    ជានិច្ច (មើល _patch_button_serialize ខាងលើ)។ ការពារ BUTTON_DATA_INVALID ដោយ
+    កាត់ callback_data ≤64 bytes និង validate icon id។"""
     glyph, icon_id = emoji_icon_for(text)
     clean_text = _strip_glyph(text, glyph) if glyph else text
     use_text = clean_text if icon_id else text
@@ -887,12 +942,58 @@ def _is_entity_parse_error(exc):
     return "entit" in msg
 
 
+def _is_button_data_invalid(exc):
+    """BUTTON_DATA_INVALID — callback_data វែងពេក / ទទេ, ឬ icon_custom_emoji_id /
+    style មិនត្រឹមត្រូវ (ឧ. admin មិនមាន Telegram Premium, emoji id ផុតសុពលភាព)។"""
+    msg = str(exc).lower()
+    return "button_data_invalid" in msg or "button_url_invalid" in msg
+
+
+def _strip_markup_extras(reply_markup):
+    """លុប style + icon_custom_emoji_id ចេញពី keyboard ទាំងមូល ដើម្បី retry ពេល
+    Telegram បដិសេធ BUTTON_DATA_INVALID (ជាញឹកញាប់ព្រោះ premium emoji id មិនត្រឹមត្រូវ)។"""
+    if reply_markup is None:
+        return None
+    try:
+        # InlineKeyboardMarkup / ReplyKeyboardMarkup ទាំងពីរមាន .keyboard
+        rows = getattr(reply_markup, "keyboard", None)
+        if not rows:
+            return reply_markup
+        for row in rows:
+            for btn in row:
+                if hasattr(btn, "_pbtn_style"):
+                    btn._pbtn_style = None
+                if hasattr(btn, "_pbtn_icon_id"):
+                    btn._pbtn_icon_id = None
+                # លុប field ផ្ទាល់បើ library បាន set រួច
+                for attr in ("style", "icon_custom_emoji_id"):
+                    if hasattr(btn, attr):
+                        try:
+                            setattr(btn, attr, None)
+                        except Exception:
+                            pass
+    except Exception as e:
+        print(f"[strip_markup_extras] failed: {e}", flush=True)
+    return reply_markup
+
+
 def _patched_send_message(chat_id, text=None, *args, **kwargs):
     try:
         return _orig_send_message(chat_id, premium_text(text), *args, **kwargs)
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain text: {e}", flush=True)
+            try:
+                return _orig_send_message(chat_id, text, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            # Retry ដោយលុប style/icon ចេញពី keyboard — ប៊ូតុងនៅដដែល តែគ្មានពណ៌/premium icon
+            print(f"[BUTTON_DATA_INVALID] retrying without style/icon: {e}", flush=True)
+            rm = kwargs.get("reply_markup")
+            if rm is not None:
+                kwargs = dict(kwargs)
+                kwargs["reply_markup"] = _strip_markup_extras(rm)
             return _orig_send_message(chat_id, text, *args, **kwargs)
         raise
 
@@ -903,6 +1004,16 @@ def _patched_reply_to(message, text=None, *args, **kwargs):
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain text: {e}", flush=True)
+            try:
+                return _orig_reply_to(message, text, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            print(f"[BUTTON_DATA_INVALID] retrying without style/icon: {e}", flush=True)
+            rm = kwargs.get("reply_markup")
+            if rm is not None:
+                kwargs = dict(kwargs)
+                kwargs["reply_markup"] = _strip_markup_extras(rm)
             return _orig_reply_to(message, text, *args, **kwargs)
         raise
 
@@ -929,6 +1040,18 @@ def _chat_and_message_id(args, kwargs):
     return chat_id, message_id
 
 
+def _retry_without_button_extras(orig_fn, e, *args, **kwargs):
+    """Helper: បើ BUTTON_DATA_INVALID → លុប style/icon ពី reply_markup រួចហៅ orig_fn ម្តងទៀត។"""
+    if not _is_button_data_invalid(e):
+        raise
+    print(f"[BUTTON_DATA_INVALID] retrying without style/icon: {e}", flush=True)
+    rm = kwargs.get("reply_markup")
+    if rm is not None:
+        kwargs = dict(kwargs)
+        kwargs["reply_markup"] = _strip_markup_extras(rm)
+    return orig_fn(*args, **kwargs)
+
+
 def _patched_edit_message_text(text=None, *args, **kwargs):
     try:
         return _orig_edit_message_text(premium_text(text), *args, **kwargs)
@@ -938,8 +1061,15 @@ def _patched_edit_message_text(text=None, *args, **kwargs):
             try:
                 return _orig_edit_message_text(text, *args, **kwargs)
             except Exception as e2:
-                if not _is_no_text_error(e2):
+                if not _is_no_text_error(e2) and not _is_button_data_invalid(e2):
                     raise
+                e = e2
+        if _is_button_data_invalid(e):
+            try:
+                return _retry_without_button_extras(
+                    _orig_edit_message_text, e, text, *args, **kwargs
+                )
+            except Exception as e2:
                 e = e2
         if _is_no_text_error(e):
             # សារដើមជារូបភាព (photo) — មិនអាច edit ជាអត្ថបទបានទេ។ ព្យាយាម edit
@@ -965,7 +1095,14 @@ def _patched_edit_message_caption(caption=None, *args, **kwargs):
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain caption: {e}", flush=True)
-            return _orig_edit_message_caption(caption, *args, **kwargs)
+            try:
+                return _orig_edit_message_caption(caption, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            return _retry_without_button_extras(
+                _orig_edit_message_caption, e, caption, *args, **kwargs
+            )
         raise
 
 
@@ -975,7 +1112,14 @@ def _patched_send_photo(chat_id, photo, caption=None, *args, **kwargs):
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain caption: {e}", flush=True)
-            return _orig_send_photo(chat_id, photo, caption, *args, **kwargs)
+            try:
+                return _orig_send_photo(chat_id, photo, caption, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            return _retry_without_button_extras(
+                _orig_send_photo, e, chat_id, photo, caption, *args, **kwargs
+            )
         raise
 
 
@@ -985,7 +1129,14 @@ def _patched_send_video(chat_id, video, caption=None, *args, **kwargs):
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain caption: {e}", flush=True)
-            return _orig_send_video(chat_id, video, caption, *args, **kwargs)
+            try:
+                return _orig_send_video(chat_id, video, caption, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            return _retry_without_button_extras(
+                _orig_send_video, e, chat_id, video, caption, *args, **kwargs
+            )
         raise
 
 
@@ -995,7 +1146,14 @@ def _patched_send_document(chat_id, document, caption=None, *args, **kwargs):
     except Exception as e:
         if _is_entity_parse_error(e):
             print(f"[premium_text] entity parse failed, retrying plain caption: {e}", flush=True)
-            return _orig_send_document(chat_id, document, caption, *args, **kwargs)
+            try:
+                return _orig_send_document(chat_id, document, caption, *args, **kwargs)
+            except Exception as e2:
+                e = e2
+        if _is_button_data_invalid(e):
+            return _retry_without_button_extras(
+                _orig_send_document, e, chat_id, document, caption, *args, **kwargs
+            )
         raise
 
 
@@ -1022,11 +1180,20 @@ def all_emoji_categories():
 
 
 def _encode_glyph(glyph):
-    return glyph.encode("utf-8").hex()
+    """Encode glyph → hex សម្រាប់ callback_data។ កាត់ hex ឲ្យខ្លីបើវែងពេក
+    (emoji_pick_ + hex + _page ត្រូវ ≤64 bytes)។"""
+    h = glyph.encode("utf-8").hex()
+    # emoji_pick_ (11) + _ (1) + page up to 3 digits ≈ 15 overhead → hex max ~49
+    if len(h) > 48:
+        h = h[:48]
+    return h
 
 
 def _decode_glyph(hex_str):
-    return bytes.fromhex(hex_str).decode("utf-8")
+    try:
+        return bytes.fromhex(hex_str).decode("utf-8")
+    except Exception:
+        return ""
 
 
 EMOJI_PAGE_SIZE = 12
@@ -2052,18 +2219,29 @@ def products_kb(uid):
         return stock_count(k) > 0
     ordered_products = sorted(products.items(), key=lambda item: 0 if _in_stock(item) else 1)
     for key, p in ordered_products:
+        # ការពារ BUTTON_DATA_INVALID: key ត្រូវ ASCII សុវត្ថិភាព + callback ≤64 bytes
+        safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", str(key))[:50] or "product"
         icon = resolve_icon(p.get("icon", "📦"))
         # product ប្រភេទ "email" គ្មាន stock file ទេ (admin ដាក់ដោយដៃម្តងម្នាក់ៗ) —
         # ចាត់ទុកជាមានស្តុកជានិច្ច មិនត្រូវ check stock_count ទេ
         is_email_type = p.get("delivery_type") == "email"
         left = None if is_email_type else stock_count(key)
+        name_disp = (p.get("name") or key or "Product").upper()
+        # កាត់ឈ្មោះឲ្យខ្លីដើម្បី button text ≤64 chars (icon + price ប្រហែល 15 chars)
+        if len(name_disp) > 40:
+            name_disp = name_disp[:37] + "…"
         if is_email_type or left > 0:
-            label = f"{icon} {p['name'].upper()} - ${p['price']:.2f}"
+            label = f"{icon} {name_disp} - ${p['price']:.2f}"
         else:
-            label = f"× {icon} {p['name'].upper()} - {t(uid, 'out_of_stock_label')}"
+            label = f"× {icon} {name_disp} - {t(uid, 'out_of_stock_label')}"
         # ចុចមើលបានជានិច្ច (មិនថាអស់ស្តុក ឬ balance អ្វីទេ) — ព័ត៌មាន photo/price/description
         # ត្រូវឲ្យ user ឃើញបានគ្រប់ពេល, ការ check ស្តុក/balance ធ្វើតែពេលចុច "✅ ទិញឥឡូវ" ប៉ុណ្ណោះ
-        btn = pbtn(label, callback_data=f"buyopt_{key}", style="success" if (is_email_type or left > 0) else "danger")
+        # ប្រើ key ដើមក្នុង callback (handler ប្រើ key ពិត) ប៉ុន្តែ _safe_callback_data នឹងកាត់បើវែង
+        btn = pbtn(
+            label,
+            callback_data=f"buyopt_{key}",
+            style="success" if (is_email_type or left > 0) else "danger",
+        )
         kb.add(btn)
     kb.add(pbtn(t(uid, "back_btn"), callback_data="back_main", style="primary"))
     return kb
